@@ -4,102 +4,57 @@
 #include <cstring>
 #include <iostream>
 #include <map>
-#include <set>
 #include <string>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
 
-struct NetworkConfig {
-    std::string host_if; // 宿主机端接口名
-    std::string cont_if; // 容器端接口名
-    std::string cont_ip; // 容器IP地址
-    std::string subnet;  // 子网
-    pid_t child_pid;     // 容器PID
-};
+// 存储 容器PID -> slirp4netns进程PID 的映射
+extern std::map<pid_t, pid_t> network_processes;
 
-class IPAllocator {
-  private:
-    std::string base_ip;
-    int cur;
-    int max;
-    std::set<int> used_ips;
-
-  public:
-    IPAllocator(std::string base, int st, int end) : base_ip(std::move(base)), cur(st), max(end) {}
-    std::string allocate() {
-        while (used_ips.find(cur) != used_ips.end()) {
-            cur = (cur + 1) % max;
-            if (cur == 0) {
-                cur = 1;
-            }
-        }
-        used_ips.insert(cur);
-        std::string ip = base_ip + "." + std::to_string(cur);
-        return ip;
-    }
-    void release(int host) { used_ips.erase(host); }
-};
-
-extern std::map<pid_t, NetworkConfig> network_configs;
-extern IPAllocator ip_pool;
-
-// 创建 veth pair 并配置网络
+// 创建 veth pair 并配置网络 (slirp4netns 版本)
+// 我们不再需要复杂的 NetworkConfig，只需要知道容器的 PID
 void setup_network(pid_t child_pid) {
-    // 创建 veth pair
-    NetworkConfig config;
-    config.child_pid = child_pid;
-    config.host_if = "veth_host_" + std::to_string(child_pid);
-    config.cont_if = "veth_cont_" + std::to_string(child_pid);
-    config.cont_ip = ip_pool.allocate();
-    config.subnet = "10.0.0.0/24";
-    // 使用 system 命令简化网络设置
-    std::string cmd = "ip link add " + config.host_if + " type veth peer name " + config.cont_if;
-    system(cmd.c_str());
-    // 将容器端 veth 放入容器的网络命名空间
-    cmd = "ip link set " + config.cont_if + " netns " + std::to_string(child_pid);
-    system(cmd.c_str());
-    // 配置宿主机端
-    cmd = "ip link set " + config.host_if + " up";
-    system(cmd.c_str());
-    // 配置容器端（在容器的网络命名空间中执行）
-    cmd = "nsenter -t " + std::to_string(child_pid) + " -n ip link set " + config.cont_if + " up";
-    system(cmd.c_str());
-    // 为容器端分配 IP 地址
-    cmd = "nsenter -t " + std::to_string(child_pid) + " -n ip addr add " + config.cont_ip + "/24 dev " + config.cont_if;
-    system(cmd.c_str());
-    // 设置默认路由
-    cmd = "nsenter -t " + std::to_string(child_pid) + " -n ip route add default via 10.0.0.1";
-    system(cmd.c_str());
-    // 配置宿主机端路由
-    cmd = "ip addr add 10.0.0.1/24 dev " + config.host_if;
-    system(cmd.c_str());
-    // 启用 IP 转发
-    system("sysctl -w net.ipv4.ip_forward=1");
-    // 设置 NAT
-    cmd = "iptables -t nat -A POSTROUTING -s " + config.subnet + " -j MASQUERADE";
-    system(cmd.c_str());
-
-    network_configs[child_pid] = config;
+    std::cout << "[Host] Setting up network for container PID " << child_pid << " using slirp4netns...\n";
+    pid_t slirp_pid = fork();
+    if (slirp_pid < 0) {
+        perror("fork failed for slirp4netns");
+        return;
+    }
+    if (slirp_pid == 0) {
+        std::string pid_str = std::to_string(child_pid);
+        char* args[] = {(char*)"slirp4netns",
+                        (char*)"--configure",             // 让 slirp4netns 自动配置 TAP 设备
+                        (char*)"--disable-host-loopback", // 禁止从容器访问宿主机的 loopback 地址
+                        (char*)pid_str.c_str(),           // 目标网络命名空间 (容器的PID)
+                        (char*)"tap0",                    // 在容器内创建的 TAP 设备名
+                        NULL};
+        execvp(args[0], const_cast<char**>(args));
+        // 如果成功，这之后的代码都不会被执行
+        perror("execvp for slirp4netns failed");
+        exit(1);
+    } else {
+        std::cout << "[Host] Started slirp4netns process with PID: " << slirp_pid << "\n";
+        network_processes[child_pid] = slirp_pid;
+    }
 }
 
 // 清理网络资源
 void cleanup_network(pid_t child_pid) {
-    if (network_configs.find(child_pid) == network_configs.end()) {
-        std::cerr << "[Host] No network config found for PID: " << child_pid << "\n";
+    if (network_processes.find(child_pid) == network_processes.end()) {
+        std::cerr << "[Host] No network process found for container PID: " << child_pid << "\n";
         return;
     }
-    NetworkConfig& config = network_configs[child_pid];
-    std::cout << "[Host] Cleaning up network for container PID: " << child_pid << "\n";
-    // 删除 NAT 规则
-    std::string del_nat_cmd = "iptables -t nat -D POSTROUTING -s " + config.subnet +
-                              " -j MASQUERADE -m comment --comment \"container_" + std::to_string(child_pid) + "\"";
-    system(del_nat_cmd.c_str());
-    // 删除宿主机端接口
-    std::string del_if_cmd = "ip link delete " + config.host_if;
-    system(del_if_cmd.c_str());
-    // 从映射中移除
-    network_configs.erase(child_pid);
-    size_t pos = config.cont_ip.find_last_of('.');
-    int host_part = stoi(config.cont_ip.substr(pos+1));
-    ip_pool.release(host_part);
+    pid_t slirp_pid = network_processes[child_pid];
+    std::cout << "[Host] Cleaning up network for container PID: " << child_pid
+              << " (killing slirp4netns PID: " << slirp_pid << ")\n";
+    // 只需要杀死对应的 slirp4netns 进程，它所管理的网络命名空间和设备会自动清理
+    if (kill(slirp_pid, SIGTERM) != 0) {
+        perror("Failed to kill slirp4netns process");
+    }
+    // 等待进程真正退出
+    waitpid(slirp_pid, NULL, 0);
+    network_processes.erase(child_pid);
 }
 
 #endif // _MY_NETWORK_
