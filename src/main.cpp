@@ -3,11 +3,15 @@
 #include <csignal>
 #include <cstring>
 #include <fstream>
-#include <grp.h>
-#include <termios.h>
+#include <memory>
 #include <vector>
-
-// --- Linux System Call Headers ---
+// pty
+#include <grp.h>
+#include <poll.h>
+#include <pty.h>
+#include <termios.h>
+#include <utmp.h>
+// Linux sysCall
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -16,78 +20,100 @@
 #include <unistd.h>
 
 // 定义子进程的栈空间大小
-#define STACK_SIZE (1024 * 1024) // 1 MB
-const char* SOCKET_PATH = "/var/run/my-docker.sock";
+#define STACK_SIZE (1024 * 1024)                     // 1 MB
+const char* SOCKET_PATH = "/var/run/my-docker.sock"; // listen_sock_fd bind()
 
 using namespace std;
 
 // 传递给子进程的参数结构体
 struct ChildArgs {
     string cgroup_path;
-    int client_sock_fd;
-    int sync_pipe_write_fd;
+    int pty_slave_fd = -1;       // PTY 从设备端的文件描述符，将成为容器的控制终端
+    int sync_pipe_write_fd = -1; // 用于父子进程同步的管道写端
     vector<char*> argv;
 };
-static void cleanup_proc(void* _arg) { umount("./proc"); }
-static void cleanup_cgroup(const string& cgroup_path) { rmdir(cgroup_path.c_str()); }
 
+// 全局监听套接字
+int listen_sock_fd = -1;
+// 全局变量，存储 (容器PID -> slirp4netns进程PID) 的映射
 std::map<pid_t, pid_t> network_processes;
-// IPAllocator ip_pool("10.0.0", 2, 254); // 10.0.0.2-254
+
+static void cleanup_proc(void* _arg) { umount("/proc"); }
+static void cleanup_cgroup(const string& cgroup_path) { rmdir(cgroup_path.c_str()); }
 
 // 创建 cgroup 并设置资源限制
 static string setup_cgroups(pid_t child_pid) {
     string cgroup_path = "/sys/fs/cgroup/my_container_" + to_string(child_pid);
-    // 创建 cgroup 目录
     mkdir(cgroup_path.c_str(), 0755);
     // 设置内存限制为 100MB
     ofstream mem_file(cgroup_path + "/memory.max");
-    mem_file << "100M";
-    mem_file.close();
+    if (mem_file.is_open()) {
+        mem_file << "100M";
+        mem_file.close();
+    }
     // 设置 CPU 限制为 50%
     ofstream cpu_file(cgroup_path + "/cpu.max");
-    cpu_file << "50000 100000"; // 50% of CPU time
-    cpu_file.close();
-    // 添加进程到 cgroup
-    ofstream procs_file(cgroup_path + "/cgroup.procs");
-    procs_file << child_pid;
-    procs_file.close();
+    if (cpu_file.is_open()) {
+        cpu_file << "50000 100000"; // 50% of CPU time
+        cpu_file.close();
+    }
+    // 将容器进程添加到 cgroup
+    ofstream procs_file(cgroup_path + "/cgroup.procs", std::ios_base::app);
+    if (procs_file.is_open()) {
+        procs_file << child_pid;
+        procs_file.close();
+    }
     return cgroup_path;
 }
 
 // 设置用户命名空间映射
 static void setup_uid_gid_maps(pid_t child_pid) {
+    // 确保在写入前，/proc/sys/user/max_user_namespaces 的值大于0
+    // 并且当前用户在 /etc/subuid 和 /etc/subgid 中有映射范围
+    // 禁用 setgroups，这是写入 gid_map 的前提
     uid_t uid = getuid();
     gid_t gid = getgid();
     // 写入 UID 映射
     string uid_map_path = "/proc/" + to_string(child_pid) + "/uid_map";
     ofstream uid_map(uid_map_path);
-    uid_map << "0 " << uid << " 1";
+    if (uid_map.is_open()) {
+        uid_map << "0 " << uid << " 1";
+        uid_map.close();
+    } else {
+        perror("Failed to open uid_map");
+    }
     uid_map.close();
     // 写入 GID 映射
     string gid_map_path = "/proc/" + to_string(child_pid) + "/gid_map";
     ofstream gid_map(gid_map_path);
-    gid_map << "0 " << gid << " 1";
-    gid_map.close();
+    if (gid_map.is_open()) {
+        gid_map << "0 " << gid << " 1";
+        gid_map.close();
+    } else {
+        perror("Failed to open gid_map");
+    }
 }
-
-int listen_sock_fd = -1;
 
 // 容器进程的主函数
 static int child_main(void* arg) {
     ChildArgs* args = static_cast<ChildArgs*>(arg);
-    // close(args->sync_pipe_read_fd); // 子进程关闭读端
-    // 1. 暂停自己，并通知父进程可以开始写 map
+    // 同步: 通过管道向父进程发送一个字节
     char sync_char = 'A';
-    write(args->sync_pipe_write_fd, &sync_char, 1);
+    if (write(args->sync_pipe_write_fd, &sync_char, 1) < 0) {
+    }
     close(args->sync_pipe_write_fd);
-    raise(SIGSTOP); // 暂停自己
-    // // I/O 重定向：将容器的标准输入、输出、错误重定向到客户端 socket
-    // dup2(args->client_sock_fd, STDIN_FILENO);
-    // dup2(args->client_sock_fd, STDOUT_FILENO);
-    // dup2(args->client_sock_fd, STDERR_FILENO);
-    // close(args->client_sock_fd);
-    cout << "[Container] My PID is: " << getpid() << "\n";
+    // 同步: 暂停自己
+    raise(SIGSTOP);
 
+    // 将 `PTY从设备端` 设置为本进程的控制终端
+    // 这个函数会自动处理 setsid(), ioctl(TIOCSCTTY), dup2() 等操作
+    // 将进程的标准输入、输出、错误重定向到 pty_slave_fd
+    if (login_tty(args->pty_slave_fd) < 0) {
+        perror("login_tty failed");
+        exit(1);
+    }
+    cout << "[Container] My PID is: " << getpid() << "\n";
+    setenv("TERM", "xterm", 1);
     if (sethostname("my-container", 12)) {
         perror("sethostname failed");
         return 1;
@@ -100,7 +126,7 @@ static int child_main(void* arg) {
         perror("mount proc failed");
         return 1;
     }
-    setenv("TERM", "xterm", 1); 
+    // 执行用户指定的命令
     cout << "[Container] Executing command: " << args->argv[0] << "\n";
     execvp(args->argv[0], args->argv.data());
     // 如果 execvp 成功，下面的代码将不会被执行
@@ -110,68 +136,118 @@ static int child_main(void* arg) {
 
 // Daemon: 处理单个客户端连接的函数
 void handle_client_connection(int client_sock_fd) {
+    // 读取客户端发来的命令
     char buffer[1024] = {0};
-    read(client_sock_fd, static_cast<char*>(buffer), sizeof(buffer)); // 读取客户端发来的命令
+    if (read(client_sock_fd, static_cast<char*>(buffer), sizeof(buffer)) < 0) {
+        perror("read failed");
+        return;
+    }
     string cmd_str(static_cast<char*>(buffer));
     cout << "[Daemon] Received command: " << cmd_str << "\n";
     // 解析命令 (简单实现)
     vector<string> parts;
-    char* token = strtok(static_cast<char*>(buffer), " ");
+    char* token = strtok(static_cast<char*>(buffer), " \n\r\t");
     while (token != NULL) {
         parts.push_back(string(token));
-        token = strtok(NULL, " ");
+        token = strtok(NULL, " \n\r\t");
     }
     if (parts.empty() || parts[0] != "run") {
-        write(client_sock_fd, "Invalid command\n", 16);
+        if (write(client_sock_fd, "Invalid command\n", 16) < 0) {
+        }
         close(client_sock_fd);
         return;
     }
-    // --- 创建容器 ---
-    char* stack = new char[STACK_SIZE];
-    char* stack_top = stack + STACK_SIZE;
+    // 创建 PTY
+    // master_fd 留在父进程(Handler)，用于和容器通信
+    // slave_fd  交给子进程(Container)，成为其控制终端
+    int master_fd = -1, slave_fd = -1;
+    if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) < 0) {
+        perror("openpty failed");
+        close(client_sock_fd);
+        close(master_fd);
+        close(slave_fd);
+        return;
+    }
+    // 创建用于父子进程同步的管道
     int pipefd[2];
-    if (pipe(pipefd) < 0) {
+    if (pipe(static_cast<int*>(pipefd)) < 0) {
         perror("pipe failed");
         return;
     }
+    // 创建容器
+    std::unique_ptr<char[]> stack = std::make_unique<char[]>(STACK_SIZE);
+    char* stack_top = stack.get() + STACK_SIZE;
     ChildArgs child_args;
-    child_args.client_sock_fd = client_sock_fd;
+    child_args.pty_slave_fd = slave_fd;
     child_args.sync_pipe_write_fd = pipefd[1];
     for (size_t i = 1; i < parts.size(); ++i) {
-        child_args.argv.push_back(strdup(parts[i].c_str()));
+        child_args.argv.push_back(const_cast<char*>(parts[i].c_str()));
     }
     child_args.argv.push_back(nullptr);
+    // clone 参数
     int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWUSER | CLONE_NEWNET | SIGCHLD;
     pid_t child_pid = clone(child_main, stack_top, clone_flags, &child_args);
+    // 父进程 (Handler) 清理
+    close(slave_fd);
+    close(pipefd[1]);
     if (child_pid == -1) {
         perror("[Daemon] clone failed");
         close(client_sock_fd);
-        delete[] stack;
+        close(master_fd);
+        close(slave_fd);
         return;
     }
-    close(pipefd[1]); // 父进程关闭写端
-
-    // --- 父进程 (Handler): 设置网络并等待容器退出 ---
+    // 父进程 (Handler) 设置网络并等待容器退出
     cout << "[Daemon] Created container with PID: " << child_pid << "\n";
+    // 同步: 等待子进程，直到它准备好
     char sync_buf;
-    read(pipefd[0], &sync_buf, 1); // 等待子进程，直到它准备好
+    if (read(pipefd[0], &sync_buf, 1) < 0) {
+        perror("read failed");
+        return;
+    }
     close(pipefd[0]);
+    // 同步: 子进程已暂停
     setup_uid_gid_maps(child_pid);
     child_args.cgroup_path = setup_cgroups(child_pid);
     setup_network(child_pid);
+    // 同步: 唤醒子进程
     kill(child_pid, SIGCONT);
-    // 等待子进程退出
-    int status;
-    waitpid(child_pid, &status, 0);
-    if (WIFEXITED(status)) {
-        cout << "[Host] Container process exited with status: " << WEXITSTATUS(status) << "\n";
-    } else if (WIFSIGNALED(status)) {
-        cout << "[Host] Container process killed by signal: " << WTERMSIG(status) << "\n";
+
+    // 使用 poll 同时监听客户端和容器终端
+    struct pollfd fds[2];
+    fds[0].fd = client_sock_fd; // 监听来自客户端的数据
+    fds[0].events = POLLIN;
+    fds[1].fd = master_fd; // 监听来自容器 PTY 的数据
+    fds[1].events = POLLIN;
+    while (true) {
+        if (poll(static_cast<pollfd*>(fds), 2, -1) < 0) {
+            if (errno == EINTR)
+                continue; // 被信号中断，正常，继续
+            perror("poll failed");
+            break;
+        }
+        if (fds[0].revents & (POLLIN | POLLHUP)) {
+            ssize_t n = read(client_sock_fd, static_cast<char*>(buffer), sizeof(buffer));
+            if (n <= 0)
+                break; // 客户端断开
+            if (write(master_fd, static_cast<char*>(buffer), n) < 0)
+                break; // 写入容器失败
+        }
+        if (fds[1].revents & (POLLIN | POLLHUP)) {
+            ssize_t n = read(master_fd, static_cast<char*>(buffer), sizeof(buffer));
+            if (n <= 0)
+                break; // 容器退出，PTY关闭
+            if (write(client_sock_fd, static_cast<char*>(buffer), n) < 0)
+                break; // 写入客户端失败
+        }
     }
+    kill(child_pid, SIGKILL);    // 确保容器进程被杀死
+    waitpid(child_pid, NULL, 0); // 回收僵尸进程
     cleanup_network(child_pid);
+    usleep(10000); // 等待内核清理cgroup
     cleanup_cgroup(child_args.cgroup_path);
     close(client_sock_fd);
-    delete[] stack;
+    close(master_fd);
 }
 
 // Daemon 的主函数
@@ -221,6 +297,7 @@ void daemon_main() {
     }
     cout << "[Daemon] Listening on " << SOCKET_PATH << "\n";
     while (true) {
+        // poll 循环中 Handler与客户端之间的 socket
         int client_sock_fd = accept(listen_sock_fd, NULL, NULL);
         if (client_sock_fd < 0) {
             perror("accept failed");
@@ -254,14 +331,13 @@ void client_main(int argc, char* argv[]) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(static_cast<char*>(addr.sun_path), SOCKET_PATH, sizeof(addr.sun_path) - 1);
     if (connect(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("connect failed. Is the daemon running with sudo?");
         // sudo groupadd mydocker
         // sudo usermod -aG mydocker $USER
         return;
     }
-
     // 将命令拼接成一个字符串发送
     string command;
     for (int i = 1; i < argc; ++i) {
@@ -270,9 +346,9 @@ void client_main(int argc, char* argv[]) {
             command += " ";
         }
     }
-    // command += "\n";
-    write(sock_fd, command.c_str(), command.length());
-    // --- 使用 fork 实现双向通信，避免 I/O 死锁 ---
+    if (write(sock_fd, command.c_str(), command.length())) {
+    }
+    // 使用 fork 实现双向通信，避免 I/O 死锁
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork for client failed");
@@ -280,22 +356,22 @@ void client_main(int argc, char* argv[]) {
         return;
     }
     if (pid == 0) {
-        // --- 子进程: 负责将用户输入(STDIN)转发到 socket ---
+        // 子进程: 负责将用户输入(STDIN)转发到 socket
         char buffer[1024];
         ssize_t n;
-        while ((n = read(STDIN_FILENO, buffer, sizeof(buffer))) > 0) {
-            if (write(sock_fd, buffer, n) != n) {
+        while ((n = read(STDIN_FILENO, static_cast<char*>(buffer), sizeof(buffer))) > 0) {
+            if (write(sock_fd, static_cast<char*>(buffer), n) != n) {
                 perror("write to socket failed");
                 break;
             }
         }
         exit(0);
     } else {
-        // --- 父进程: 负责将 socket 的数据转发到终端(STDOUT) ---
+        // 父进程: 负责将 socket 的数据转发到终端(STDOUT)
         char buffer[1024];
         ssize_t n;
-        while ((n = read(sock_fd, buffer, sizeof(buffer))) > 0) {
-            if (write(STDOUT_FILENO, buffer, n) != n) {
+        while ((n = read(sock_fd, static_cast<char*>(buffer), sizeof(buffer))) > 0) {
+            if (write(STDOUT_FILENO, static_cast<char*>(buffer), n) != n) {
                 perror("write to stdout failed");
                 break;
             }
@@ -320,6 +396,7 @@ void cleanup_daemon(int sig) {
 
 int main(int argc, char* argv[]) {
     if (argc == 1) {
+        // [Daemon 模式] 如果没有参数，则作为守护进程启动
         signal(SIGINT, cleanup_daemon);
         signal(SIGTERM, cleanup_daemon);
         daemon_main();
@@ -327,6 +404,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Usage: " << argv[0] << " run <command>\n";
         return 1;
     } else {
+        // [Client 模式] 作为客户端启动
         client_main(argc, argv);
     }
     return 0;

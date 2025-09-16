@@ -9,11 +9,10 @@
 #include <unistd.h>
 #include <vector>
 
-// 存储 容器PID -> slirp4netns进程PID 的映射
+// 存储 (容器PID -> slirp4netns进程PID) 的映射
 extern std::map<pid_t, pid_t> network_processes;
 
-// 创建 veth pair 并配置网络 (slirp4netns 版本)
-// 我们不再需要复杂的 NetworkConfig，只需要知道容器的 PID
+// 创建 veth pair 并配置网络 (通过slirp4netns)
 void setup_network(pid_t child_pid) {
     std::cout << "[Host] Setting up network for container PID " << child_pid << " using slirp4netns...\n";
     pid_t slirp_pid = fork();
@@ -30,7 +29,7 @@ void setup_network(pid_t child_pid) {
                         (char*)"tap0",                    // 在容器内创建的 TAP 设备名
                         NULL};
         execvp(args[0], const_cast<char**>(args));
-        // 如果成功，这之后的代码都不会被执行
+        // 如果 execvp 成功，下面的代码将不会被执行
         perror("execvp for slirp4netns failed");
         exit(1);
     } else {
