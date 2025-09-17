@@ -1,9 +1,24 @@
 #!/bin/bash
 # sudo debootstrap --variant=minbase jammy ./my-rootfs http://us.archive.ubuntu.com/ubuntu/
-if [ ! -f ./my-rootfs ]; then
-    mkdir -p my-rootfs
-    cd my-rootfs
-    mkdir -p {bin,sbin,usr,usr/bin,usr/sbin,usr/lib,etc,etc/init.d,lib,proc,sys,dev,run,var}
+set -e
+ROOTFS=""
+while true;do
+    case "$1" in
+        --fs)
+            if [ -z "$2" ]; then
+                echo "Error: --fs requires an argument" >&2
+                exit 1
+            fi
+            ROOTFS="$2"
+            shift 2;;
+        *) break;;
+    esac
+done
+
+if [ ! -d ${ROOTFS} ]; then
+    mkdir -p ${ROOTFS}
+    cd ${ROOTFS}
+    mkdir -p {bin,sbin,usr/{bin,sbin,lib},etc/init.d,lib,proc,sys,dev/pts,run,var}
     cp ../app/busybox bin/busybox
 
     sudo bin/busybox --install bin

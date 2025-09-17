@@ -87,7 +87,9 @@ sudo usermod -aG mydocker $USER
 使用 `sudo` 运行守护进程。它将开始监听客户端连接。
 ```sh
 # sudo ./build/my-docker
-make rund``````sh
+make rund
+```
+```sh
 # 预期输出:
 [Daemon] Starting...
 [Daemon] Listening on /var/run/my-docker.sock
@@ -98,7 +100,8 @@ make rund``````sh
 ```bash
 # ./my-docker run /bin/sh
 make run
-``````sh
+```
+```sh
 # 现在您应该已经进入了容器的 Shell！
 root@my-container:/# 
 ```
@@ -111,8 +114,25 @@ root@my-container:/# echo $$
 root@my-container:/# ps aux
 # 查看主机名
 root@my-container:/# hostname
-# 退出容器
+# 退出容器 Ctrl+D
 root@my-container:/# exit
 ```
 
 要停止守护进程，请回到**终端 1** 并按下 `Ctrl+C`。
+
+## more details
+```sh
+# 启动 守护进程 + run一个程序的底层
+> ps aux | grep my-docker
+# sudo 命令出于安全隔离会openpty()+fork()创建一个新的会话&终端(pts/11)
+# 而原本的终端(pts/10)负责：阻塞在 poll(fds, ...) 或 select(fds, ...)，监听自己的 STDIN 和 master_fd 缓冲区。poll()调用返回为可读时，就写到STDOUT
+root       25233  0.0  0.0   8924  5248 pts/10   S+   14:05   0:00 sudo build/my-docker
+# sudo 创建的辅助进程，作为新会话(pts/11)的leader（Ss），fork()的子进程 execvp("build/my-docker", ...)，父进程作为leader处理信号、子进程退出码、清理等工作
+root       25234  0.0  0.0   8924  2300 pts/11   Ss   14:05   0:00 sudo build/my-docker
+root       25235  0.0  0.0   6088  3584 pts/11   S+   14:05   0:00 build/my-docker      # 这是主守护进程(Daemon)
+# 使用 fork 实现双向通信，避免 I/O 死锁
+username   25612  0.0  0.0   6088  3072 pts/8    S+   14:06   0:00 build/my-docker run /bin/sh # 客户端的父进程(Socket -> STDOUT)
+username   25613  0.0  0.0   6088   256 pts/8    S+   14:06   0:00 build/my-docker run /bin/sh # 客户端的子进程(STDIN  -> Socket)
+root       25614  0.0  0.0   7116  3332 pts/11   S+   14:06   0:00 build/my-docker      # Daemon fork 的 Handler 进程，使用 clone() 创建真正的容器进程
+username   25711  0.0  0.0   4028  2304 pts/12   S+   14:06   0:00 grep --color=auto my-docker
+```

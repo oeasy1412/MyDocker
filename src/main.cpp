@@ -12,6 +12,7 @@
 #include <termios.h>
 #include <utmp.h>
 // Linux sysCall
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -37,8 +38,13 @@ struct ChildArgs {
 int listen_sock_fd = -1;
 // 全局变量，存储 (容器PID -> slirp4netns进程PID) 的映射
 std::map<pid_t, pid_t> network_processes;
+struct termios original_termios;
 
-static void cleanup_proc(void* _arg) { umount("/proc"); }
+void restore_terminal_mode() {
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios);
+    cout << "\n[Client] Terminal mode restored.\n";
+}
+
 static void cleanup_cgroup(const string& cgroup_path) { rmdir(cgroup_path.c_str()); }
 
 // 创建 cgroup 并设置资源限制
@@ -136,6 +142,13 @@ static int child_main(void* arg) {
 
 // Daemon: 处理单个客户端连接的函数
 void handle_client_connection(int client_sock_fd) {
+    // 先接收窗口大小
+    struct winsize win_size;
+    if (read(client_sock_fd, &win_size, sizeof(win_size)) != sizeof(win_size)) {
+        perror("[Daemon] read winsize failed");
+        close(client_sock_fd);
+        return;
+    }
     // 读取客户端发来的命令
     char buffer[1024] = {0};
     if (read(client_sock_fd, static_cast<char*>(buffer), sizeof(buffer)) < 0) {
@@ -167,6 +180,10 @@ void handle_client_connection(int client_sock_fd) {
         close(master_fd);
         close(slave_fd);
         return;
+    }
+    cout << "[Daemon] Received window size: (" << win_size.ws_row << " rows," << win_size.ws_col << " cols)\n";
+    if (ioctl(master_fd, TIOCSWINSZ, &win_size) < 0) {
+        perror("ioctl TIOCSWINSZ failed");
     }
     // 创建用于父子进程同步的管道
     int pipefd[2];
@@ -207,6 +224,7 @@ void handle_client_connection(int client_sock_fd) {
     }
     close(pipefd[0]);
     // 同步: 子进程已暂停
+    // string container_pts_path = "./my-rootfs/dev/pts/0";
     setup_uid_gid_maps(child_pid);
     child_args.cgroup_path = setup_cgroups(child_pid);
     setup_network(child_pid);
@@ -303,7 +321,7 @@ void daemon_main() {
             perror("accept failed");
             continue;
         }
-        cout << "[Daemon] Accepted new connection." << "\n";
+        cout << "[Daemon] Accepted new connection.\n";
         // Fork 一个子进程来处理这个连接，主进程继续监听
         pid_t handler_pid = fork();
         if (handler_pid == 0) {    // 子进程 (Handler)
@@ -333,9 +351,35 @@ void client_main(int argc, char* argv[]) {
     addr.sun_family = AF_UNIX;
     strncpy(static_cast<char*>(addr.sun_path), SOCKET_PATH, sizeof(addr.sun_path) - 1);
     if (connect(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("connect failed. Is the daemon running with sudo?");
+        perror("connect failed. Is the daemon running and are you in groups mydocker?");
         // sudo groupadd mydocker
         // sudo usermod -aG mydocker $USER
+        return;
+    }
+    // 将本地终端设置为原始模式
+    if (isatty(STDIN_FILENO) == 0) {
+        cerr << "Not a terminal.\n";
+        return;
+    }
+    if (tcgetattr(STDIN_FILENO, &original_termios) < 0) { // 保存终端设置
+        perror("tcgetattr failed");
+        return;
+    }
+    // 注册退出函数，确保终端模式一定会被恢复
+    atexit(restore_terminal_mode);
+    struct termios raw = original_termios;
+    // cfmakeraw 会关闭回显(ECHO)，关闭规范模式(ICANON)等
+    cfmakeraw(&raw);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) < 0) {
+        perror("tcsetattr failed");
+        return;
+    }
+    // 获取并发送窗口大小
+    struct winsize win_size;
+    ioctl(STDIN_FILENO, TIOCGWINSZ, &win_size);
+    if (write(sock_fd, &win_size, sizeof(win_size)) != sizeof(win_size)) {
+        perror("write winsize failed");
+        close(sock_fd);
         return;
     }
     // 将命令拼接成一个字符串发送
