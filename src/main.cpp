@@ -16,6 +16,7 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -124,8 +125,45 @@ static int child_main(void* arg) {
         perror("sethostname failed");
         return 1;
     }
-    if (chdir("./my-rootfs") != 0 || chroot(".") != 0) {
-        perror("chroot failed");
+    const char* rootfs_path = "./my-rootfs";
+    // 确保新的 rootfs 是一个独立的挂载点，这是 pivot_root 的前提。
+    // 最简单的方法是把它 bind mount 到它自身。
+    // 同时，将挂载传播设置为 PRIVATE，防止宿主机的挂载事件泄露进来。
+    if (mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL) != 0) {
+        perror("mount make private failed");
+        return 1;
+    }
+    if (mount(rootfs_path, rootfs_path, "bind", MS_BIND | MS_REC, NULL) != 0) {
+        perror("mount bind rootfs failed");
+        return 1;
+    }
+    // 创建一个目录用于存放旧的 root
+    string old_root_path = string(rootfs_path) + "/.old_root";
+    if (mkdir(old_root_path.c_str(), 0777) != 0 && errno != EEXIST) {
+        perror("mkdir for .old_root failed");
+        return 1;
+    }
+    // 执行 pivot_root
+    if (chdir(rootfs_path) != 0) {
+        perror("chdir to new rootfs failed");
+        return 1;
+    }
+    if (syscall(SYS_pivot_root, ".", ".old_root") != 0) {
+        perror("pivot_root failed");
+        return 1;
+    }
+    // 卸载旧的 root，实现彻底隔离
+    if (umount2("/.old_root", MNT_DETACH) != 0) {
+        perror("umount old root failed");
+        return 1;
+    }
+    // if (rmdir("/.old_root") != 0) {
+    //     perror("rmdir .old_root failed");
+    //     return 1;
+    // }
+    // pivot_root 不会改变当前工作目录，必须手动切换到新的根
+    if (chdir("/") != 0) {
+        perror("chdir to new root / failed");
         return 1;
     }
     if (mount("proc", "./proc", "proc", 0, NULL) != 0) {
@@ -202,7 +240,8 @@ void handle_client_connection(int client_sock_fd) {
     }
     child_args.argv.push_back(nullptr);
     // clone 参数
-    int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWUSER | CLONE_NEWNET | SIGCHLD;
+    int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWUSER | CLONE_NEWCGROUP | CLONE_NEWIPC |
+                      CLONE_NEWNET | SIGCHLD;
     pid_t child_pid = clone(child_main, stack_top, clone_flags, &child_args);
     // 父进程 (Handler) 清理
     close(slave_fd);

@@ -18,7 +18,7 @@ done
 if [ ! -d ${ROOTFS} ]; then
     mkdir -p ${ROOTFS}
     cd ${ROOTFS}
-    mkdir -p {bin,sbin,usr/{bin,sbin,lib},etc/init.d,lib,proc,sys,dev/pts,run,var}
+    mkdir -p {bin,sbin,usr/{bin,sbin,lib},etc/init.d,lib,proc,sys,dev/pts,run,var,.old_root}
     cp ../app/busybox bin/busybox
 
     sudo bin/busybox --install bin
